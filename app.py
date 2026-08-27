@@ -459,7 +459,7 @@ with st.sidebar:
     st.subheader("RSI / Pivot")
     rsi_period = st.number_input("RSI period", 2, 50, 14)
     left = st.number_input("Pivot left", 1, 10, 2)
-    right = st.number_input("Pivot right", 1, 10, 2)
+    right = st.number_input("Pivot right", 0, 10, 0)
     search_bars = st.number_input("Previous pivot search bars", 5, 200, 36)
     min_gap = st.number_input("Min bars between pivots", 1, 50, 2)
     min_rsi_diff = st.number_input("Min RSI difference", 0.0, 30.0, 2.0, step=0.1)
