@@ -239,7 +239,14 @@ def download_tf(symbol, timeframe, years, trading_day):
     for a given symbol+timeframe+years are fetched once per day and then
     served from cache — same-day reruns give identical, stable results
     instead of hitting Yahoo again and risking a different rate-limit
-    outcome each time."""
+    outcome each time.
+
+    IMPORTANT: on failure we RAISE instead of returning an empty
+    DataFrame. Streamlit's cache_data does not cache a call that raises,
+    so a symbol that fails (rate-limited / no data) is retried fresh on
+    the next scan instead of being stuck as "no data" for the rest of
+    the cache TTL.
+    """
     info = TF_MAP[timeframe]
     period = info["period"]
     if timeframe in ("Monthly","Weekly","Daily"):
@@ -248,17 +255,20 @@ def download_tf(symbol, timeframe, years, trading_day):
 
     df = _yf_download_with_retry(symbol + ".NS", period, info["interval"])
     if df is None or df.empty:
-        return pd.DataFrame()
+        raise RuntimeError(f"no data for {symbol}")
 
     df = flatten(df)
     need = ["Open","High","Low","Close","Volume"]
     if not all(c in df.columns for c in need):
-        return pd.DataFrame()
+        raise RuntimeError(f"missing OHLCV columns for {symbol}")
 
     df = df[need].dropna(subset=["Close"])
     if timeframe == "4 Hour":
         df = to_4h(df)
-    return remove_incomplete(df, timeframe)
+    result = remove_incomplete(df, timeframe)
+    if result.empty:
+        raise RuntimeError(f"empty after cleanup for {symbol}")
+    return result
 
 def signal_cutoff(years):
     return pd.Timestamp.now().tz_localize(None) - pd.DateOffset(
@@ -421,7 +431,11 @@ def scan_symbol(symbol, params):
     # nahi karte, jisse rate-limit / empty-response chance kam ho jaata hai.
     time.sleep(random.uniform(0, 0.4))
 
-    d = download_tf(symbol, timeframe, years, _current_trading_day())
+    try:
+        d = download_tf(symbol, timeframe, years, _current_trading_day())
+    except Exception as e:
+        return symbol, [], f"no data ({e})"
+
     if d.empty:
         return symbol, [], "no data"
 
@@ -493,7 +507,7 @@ with st.sidebar:
     st.subheader("RSI / Pivot")
     rsi_period = st.number_input("RSI period", 2, 50, 14)
     left = st.number_input("Pivot left", 1, 10, 2)
-    right = st.number_input("Pivot right", 0, 10, 0)
+    right = st.number_input("Pivot right", 1, 10, 2)
     search_bars = st.number_input("Previous pivot search bars", 5, 200, 36)
     min_gap = st.number_input("Min bars between pivots", 1, 50, 2)
     min_rsi_diff = st.number_input("Min RSI difference", 0.0, 30.0, 2.0, step=0.1)
@@ -535,6 +549,7 @@ if run:
     rows = []
     errors = 0
     completed = 0
+    error_detail = []
 
     with ThreadPoolExecutor(max_workers=int(workers)) as ex:
         futures = {
@@ -550,8 +565,10 @@ if run:
                 rows.extend(found)
                 if err:
                     errors += 1
-            except Exception:
+                    error_detail.append((sym, err))
+            except Exception as e:
                 errors += 1
+                error_detail.append((sym, f"exception: {e}"))
 
             progress.progress(completed / max(1, len(fno_stocks)))
             status.info(
@@ -561,6 +578,20 @@ if run:
 
     progress.empty()
     status.empty()
+
+    if error_detail:
+        with st.expander(f"⚠ Data fetch failed for {len(error_detail)} symbol(s) — click to see which"):
+            st.dataframe(
+                pd.DataFrame(error_detail, columns=["Symbol", "Reason"]),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(
+                "Yeh symbols is scan mein Yahoo se data nahi le paaye (rate-limit/timeout ke baad "
+                "bhi 4 retries fail), isliye inke liye koi signal check hi nahi ho paaya — 'no signal' "
+                "aur 'fetch failed' alag cheezein hain. Dobara RUN SCANNER dabao, failed symbols agli "
+                "baar fresh retry honge (cache nahi hote)."
+            )
 
     if rows:
         df = pd.DataFrame(rows)
