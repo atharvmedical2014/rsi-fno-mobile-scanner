@@ -304,6 +304,17 @@ def detect_signals(
         return []
 
     x = df.copy()
+    # Final safety net: chahe upstream se jo bhi mile, yahan guarantee karte
+    # hain ki har column naam ek hi baar aaye — warna x["Close"] ek Series
+    # ki jagah DataFrame ban jaata hai aur .iloc[cur] scalar ki jagah ek
+    # poori row (Series) deta hai, jisse float() par "cannot convert the
+    # series to float" crash aata hai.
+    if x.columns.duplicated().any():
+        x = x.loc[:, ~x.columns.duplicated()].copy()
+    for col in ("Open", "High", "Low", "Close", "Volume"):
+        if col in x.columns and isinstance(x[col], pd.DataFrame):
+            x[col] = x[col].iloc[:, 0]
+
     x["RSI"] = rsi_wilder(x["Close"], rsi_period)
     cutoff = signal_cutoff(years)
     out = []
@@ -467,9 +478,15 @@ def scan_symbol(symbol, params):
     except Exception as e:
         # Poora traceback (last 2 frames) capture karte hain taaki agar
         # koi aur edge-case crash kare to exact line pata chale, sirf
-        # generic "exception: ..." message nahi.
+        # generic "exception: ..." message nahi. Data ka actual shape bhi
+        # capture karte hain taaki agar duplicate-column jaisa issue phir
+        # bhi bache to seedha dikh jaaye.
         tb = "".join(traceback.format_exception(type(e), e, e.__traceback__)[-2:]).strip()
-        return symbol, [], f"signal-calc error: {tb}"
+        diag = (
+            f"cols={list(d.columns)} dup={bool(d.columns.duplicated().any())} "
+            f"shape={d.shape}"
+        )
+        return symbol, [], f"signal-calc error [{diag}]: {tb}"
 
     rows = [{"Symbol": symbol, **s} for s in sigs]
     return symbol, rows, None
