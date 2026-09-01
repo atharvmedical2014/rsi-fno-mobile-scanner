@@ -67,10 +67,13 @@ def get_fno_stocks():
         if sym_col is None:
             raise ValueError("Symbol column not found in NSE F&O lot-size file.")
 
+        JUNK_VALUES = {"SYMBOL", "UNDERLYING", "NAN", ""}
         syms = sorted({
             clean_symbol(x)
             for x in df[sym_col].dropna()
-            if clean_symbol(x) and clean_symbol(x) not in INDEX_SYMBOLS
+            if clean_symbol(x)
+            and clean_symbol(x) not in INDEX_SYMBOLS
+            and clean_symbol(x) not in JUNK_VALUES
         })
         # sanity check
         if len(syms) >= 150:
@@ -95,10 +98,13 @@ def get_fno_stocks():
         if best is None:
             raise ValueError("Fallback F&O table not found.")
         sym_col = next(c for c in best.columns if "symbol" in str(c).lower())
+        JUNK_VALUES = {"SYMBOL", "UNDERLYING", "NAN", ""}
         syms = sorted({
             clean_symbol(x)
             for x in best[sym_col].dropna()
-            if clean_symbol(x) and clean_symbol(x) not in INDEX_SYMBOLS
+            if clean_symbol(x)
+            and clean_symbol(x) not in INDEX_SYMBOLS
+            and clean_symbol(x) not in JUNK_VALUES
         })
         if len(syms) < 150:
             raise ValueError("Fallback returned too few symbols.")
@@ -109,6 +115,8 @@ def get_fno_stocks():
         ) from e
 
 def rsi_wilder(close, period=14):
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
     s = pd.to_numeric(close, errors="coerce")
     d = s.diff()
     gain = d.clip(lower=0)
@@ -146,6 +154,13 @@ def flatten(df):
     if isinstance(df.columns, pd.MultiIndex):
         df = df.copy()
         df.columns = df.columns.get_level_values(0)
+    # yfinance kabhi-kabhi (especially rate-limit/partial-response ke time)
+    # duplicate column names de deta hai. Duplicate hone par df["Close"]
+    # ek Series ki jagah DataFrame return karta hai, jo aage RSI/pivot
+    # calculation mein "arg must be a list, tuple, 1-d array, or Series"
+    # crash deta hai. Isliye duplicate columns ko yahin drop kar dete hain.
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()]
     return df
 
 def to_4h(df):
