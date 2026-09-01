@@ -1,6 +1,7 @@
-
 import math
 import re
+import time
+import random
 from io import StringIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -201,22 +202,51 @@ def remove_incomplete(df, timeframe):
 
     return x.dropna(subset=["Close"])
 
-def download_tf(symbol, timeframe, years):
+def _current_trading_day():
+    """IST calendar date string, used only as a cache-busting key so the
+    cache naturally refreshes once per day (new key each day)."""
+    return pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y-%m-%d")
+
+def _yf_download_with_retry(ticker, period, interval, attempts=4):
+    """Yahoo Finance ka unofficial API concurrent/high-frequency requests par
+    randomly rate-limit/empty-response deta hai. Retry + exponential backoff
+    + jitter se transient failures handle hote hain, taaki wahi symbol
+    baar-baar 'no data' na ban jaaye."""
+    last_exc = None
+    for i in range(attempts):
+        try:
+            df = yf.download(
+                ticker,
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+                timeout=20,
+            )
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            last_exc = e
+        # backoff before retrying (skip sleep after the last attempt)
+        if i < attempts - 1:
+            time.sleep((1.5 ** i) + random.uniform(0, 0.75))
+    return pd.DataFrame()
+
+@st.cache_data(ttl=6*3600, show_spinner=False)
+def download_tf(symbol, timeframe, years, trading_day):
+    """trading_day is only used as a cache key (IST date string) so results
+    for a given symbol+timeframe+years are fetched once per day and then
+    served from cache — same-day reruns give identical, stable results
+    instead of hitting Yahoo again and risking a different rate-limit
+    outcome each time."""
     info = TF_MAP[timeframe]
     period = info["period"]
     if timeframe in ("Monthly","Weekly","Daily"):
         req_years = max(5, int(math.ceil(years))+5)
         period = f"{min(req_years,10)}y"
 
-    df = yf.download(
-        symbol + ".NS",
-        period=period,
-        interval=info["interval"],
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-        timeout=20,
-    )
+    df = _yf_download_with_retry(symbol + ".NS", period, info["interval"])
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -387,7 +417,11 @@ def scan_symbol(symbol, params):
         min_rsi_diff, min_price_diff_pct, strict_extreme
     ) = params
 
-    d = download_tf(symbol, timeframe, years)
+    # Chhota random stagger — sab threads ek hi instant pe Yahoo ko hit
+    # nahi karte, jisse rate-limit / empty-response chance kam ho jaata hai.
+    time.sleep(random.uniform(0, 0.4))
+
+    d = download_tf(symbol, timeframe, years, _current_trading_day())
     if d.empty:
         return symbol, [], "no data"
 
@@ -459,7 +493,7 @@ with st.sidebar:
     st.subheader("RSI / Pivot")
     rsi_period = st.number_input("RSI period", 2, 50, 14)
     left = st.number_input("Pivot left", 1, 10, 2)
-    right = st.number_input("Pivot right", 0, 10, 0)
+    right = st.number_input("Pivot right", 1, 10, 2)
     search_bars = st.number_input("Previous pivot search bars", 5, 200, 36)
     min_gap = st.number_input("Min bars between pivots", 1, 50, 2)
     min_rsi_diff = st.number_input("Min RSI difference", 0.0, 30.0, 2.0, step=0.1)
@@ -470,10 +504,15 @@ with st.sidebar:
         value=False
     )
 
-    workers = st.slider("Parallel workers", 1, 8, 4)
+    workers = st.slider("Parallel workers", 1, 8, 2)
+    st.caption(
+        "Kam workers = Yahoo Finance rate-limit hone ka chance kam, "
+        "results zyada consistent aate hain."
+    )
 
     if st.button("🔄 Refresh F&O Universe"):
         get_fno_stocks.clear()
+        download_tf.clear()
         st.rerun()
 
 run = st.button(
