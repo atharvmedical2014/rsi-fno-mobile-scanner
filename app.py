@@ -2,6 +2,8 @@ import math
 import re
 import time
 import random
+import gzip
+import json
 import traceback
 from io import StringIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,7 +12,6 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-import yfinance as yf
 
 st.set_page_config(
     page_title="RSI Bullish Divergence — NSE F&O",
@@ -23,13 +24,19 @@ APP_TITLE = "RSI Bullish + Bearish Divergence — NSE F&O Stocks"
 NSE_FO_LOTS = "https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv"
 FALLBACK_URL = "https://optionperks.com/lot_size"
 
+UPSTOX_NSE_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+UPSTOX_HIST_CANDLE_URL = "https://api.upstox.com/v3/historical-candle/{instrument_key}/{unit}/{interval}/{to_date}/{from_date}"
+
 INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
 
+# Upstox V3: unit ∈ {minutes, hours, days, weeks, months}, interval = custom
+# number within that unit. Hours/minutes data sirf Jan-2022 se available hai,
+# Days/Weeks/Months Jan-2000 se.
 TF_MAP = {
-    "Monthly": {"interval":"1mo", "period":"10y"},
-    "Weekly":  {"interval":"1wk", "period":"10y"},
-    "Daily":   {"interval":"1d",  "period":"10y"},
-    "4 Hour":  {"interval":"1h",  "period":"730d"},
+    "Monthly": {"unit": "months", "interval": "1"},
+    "Weekly":  {"unit": "weeks",  "interval": "1"},
+    "Daily":   {"unit": "days",   "interval": "1"},
+    "4 Hour":  {"unit": "hours",  "interval": "4"},
 }
 
 def clean_symbol(x):
@@ -153,34 +160,64 @@ def pivot_highs(series, left=2, right=2):
             out.append(i)
     return out
 
-def flatten(df):
-    if df is None or df.empty:
-        return pd.DataFrame()
-    if isinstance(df.columns, pd.MultiIndex):
-        df = df.copy()
-        df.columns = df.columns.get_level_values(0)
-    # yfinance kabhi-kabhi (especially rate-limit/partial-response ke time)
-    # duplicate column names de deta hai. Duplicate hone par df["Close"]
-    # ek Series ki jagah DataFrame return karta hai, jo aage RSI/pivot
-    # calculation mein "arg must be a list, tuple, 1-d array, or Series"
-    # crash deta hai. Isliye duplicate columns ko yahin drop kar dete hain.
-    if df.columns.duplicated().any():
-        df = df.loc[:, ~df.columns.duplicated()]
-    return df
+def get_upstox_token():
+    """Secrets se token uthate hain (recommended — GitHub pe commit nahi hota).
+    Agar secrets mein nahi mila to sidebar wale password-box se liya hua
+    session_state token fallback ke roop mein use hota hai."""
+    token = ""
+    try:
+        token = st.secrets.get("UPSTOX_ACCESS_TOKEN", "")
+    except Exception:
+        token = ""
+    if not token:
+        token = st.session_state.get("upstox_token", "")
+    return (token or "").strip()
 
-def to_4h(df):
-    if df.empty:
-        return df
-    x = df.copy()
-    idx = pd.to_datetime(x.index)
-    if idx.tz is not None:
-        idx = idx.tz_convert("Asia/Kolkata")
-    x.index = idx
-    return x.resample(
-        "4h", origin="start_day", offset="9h15min"
-    ).agg({
-        "Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"
-    }).dropna(subset=["Close"])
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def get_instrument_map():
+    """NSE trading_symbol -> Upstox instrument_key mapping. Upstox is file
+    roughly 6 AM IST par refresh hoti hai, isliye 24h cache theek hai."""
+    r = requests.get(UPSTOX_NSE_INSTRUMENTS_URL, timeout=30)
+    r.raise_for_status()
+    raw = gzip.decompress(r.content)
+    data = json.loads(raw)
+    mapping = {}
+    for item in data:
+        if item.get("instrument_type") == "EQ" and item.get("segment") == "NSE_EQ":
+            sym = clean_symbol(item.get("trading_symbol", ""))
+            key = item.get("instrument_key")
+            if sym and key:
+                mapping[sym] = key
+    return mapping
+
+def _upstox_fetch_with_retry(instrument_key, unit, interval, from_date, to_date, token, attempts=3):
+    url = UPSTOX_HIST_CANDLE_URL.format(
+        instrument_key=instrument_key, unit=unit, interval=interval,
+        to_date=to_date, from_date=from_date,
+    )
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+    last_exc = None
+    for i in range(attempts):
+        try:
+            r = requests.get(url, headers=headers, timeout=20)
+            if r.status_code == 200:
+                js = r.json()
+                return js.get("data", {}).get("candles", []) or []
+            if r.status_code == 401:
+                raise RuntimeError("Upstox token invalid/expired (401) — sidebar mein fresh token daalein")
+            if r.status_code == 429:
+                time.sleep((1.5 ** i) + random.uniform(0, 0.5))
+                continue
+            last_exc = RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            last_exc = e
+        if i < attempts - 1:
+            time.sleep((1.2 ** i) + random.uniform(0, 0.3))
+    if last_exc:
+        raise last_exc
+    return []
 
 def remove_incomplete(df, timeframe):
     if df.empty:
@@ -227,64 +264,58 @@ def _current_trading_day():
     cache naturally refreshes once per day (new key each day)."""
     return pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y-%m-%d")
 
-def _yf_download_with_retry(ticker, period, interval, attempts=4):
-    """Yahoo Finance ka unofficial API concurrent/high-frequency requests par
-    randomly rate-limit/empty-response deta hai. Retry + exponential backoff
-    + jitter se transient failures handle hote hain, taaki wahi symbol
-    baar-baar 'no data' na ban jaaye."""
-    last_exc = None
-    for i in range(attempts):
-        try:
-            df = yf.download(
-                ticker,
-                period=period,
-                interval=interval,
-                auto_adjust=False,
-                progress=False,
-                threads=False,
-                timeout=20,
-            )
-            if df is not None and not df.empty:
-                return df
-        except Exception as e:
-            last_exc = e
-        # backoff before retrying (skip sleep after the last attempt)
-        if i < attempts - 1:
-            time.sleep((1.5 ** i) + random.uniform(0, 0.75))
-    return pd.DataFrame()
-
 @st.cache_data(ttl=6*3600, show_spinner=False)
-def download_tf(symbol, timeframe, years, trading_day):
+def download_tf(symbol, timeframe, years, trading_day, token):
     """trading_day is only used as a cache key (IST date string) so results
     for a given symbol+timeframe+years are fetched once per day and then
-    served from cache — same-day reruns give identical, stable results
-    instead of hitting Yahoo again and risking a different rate-limit
-    outcome each time.
+    served from cache — same-day reruns give identical, stable results.
+    token bhi cache key mein hai taaki din mein token refresh hone par
+    purana cached-fail result reuse na ho.
 
     IMPORTANT: on failure we RAISE instead of returning an empty
     DataFrame. Streamlit's cache_data does not cache a call that raises,
-    so a symbol that fails (rate-limited / no data) is retried fresh on
-    the next scan instead of being stuck as "no data" for the rest of
-    the cache TTL.
+    so a symbol that fails is retried fresh on the next scan instead of
+    being stuck as "no data" for the rest of the cache TTL.
     """
-    info = TF_MAP[timeframe]
-    period = info["period"]
-    if timeframe in ("Monthly","Weekly","Daily"):
-        req_years = max(5, int(math.ceil(years))+5)
-        period = f"{min(req_years,10)}y"
+    if not token:
+        raise RuntimeError("Upstox access token missing — sidebar mein daalein")
 
-    df = _yf_download_with_retry(symbol + ".NS", period, info["interval"])
-    if df is None or df.empty:
+    instrument_map = get_instrument_map()
+    instrument_key = instrument_map.get(clean_symbol(symbol))
+    if not instrument_key:
+        raise RuntimeError(f"no instrument_key for {symbol}")
+
+    info = TF_MAP[timeframe]
+    unit, interval = info["unit"], info["interval"]
+
+    now_ts = pd.Timestamp.now(tz="Asia/Kolkata").normalize()
+    to_date = now_ts.date()
+    if timeframe == "4 Hour":
+        # Upstox hours/minutes data sirf Jan-2022 se available hai.
+        req_years = min(max(1, int(math.ceil(years))), 4)
+        from_ts = max(now_ts - pd.DateOffset(years=req_years), pd.Timestamp("2022-01-15"))
+    else:
+        req_years = min(max(5, int(math.ceil(years)) + 5), 10)
+        from_ts = now_ts - pd.DateOffset(years=req_years)
+    from_date = from_ts.date()
+
+    candles = _upstox_fetch_with_retry(
+        instrument_key, unit, interval, from_date.isoformat(), to_date.isoformat(), token
+    )
+    if not candles:
         raise RuntimeError(f"no data for {symbol}")
 
-    df = flatten(df)
-    need = ["Open","High","Low","Close","Volume"]
-    if not all(c in df.columns for c in need):
-        raise RuntimeError(f"missing OHLCV columns for {symbol}")
+    # Upstox candle row: [timestamp, open, high, low, close, volume, open_interest]
+    df = pd.DataFrame(
+        [c[:6] for c in candles],
+        columns=["ts", "Open", "High", "Low", "Close", "Volume"],
+    )
+    df["ts"] = pd.to_datetime(df["ts"])
+    df = df.set_index("ts").sort_index()
+    for c in ["Open", "High", "Low", "Close", "Volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["Close"])
 
-    df = df[need].dropna(subset=["Close"])
-    if timeframe == "4 Hour":
-        df = to_4h(df)
     result = remove_incomplete(df, timeframe)
     if result.empty:
         raise RuntimeError(f"empty after cleanup for {symbol}")
@@ -455,15 +486,15 @@ def detect_signals(
 def scan_symbol(symbol, params):
     (
         timeframe, divergence_mode, years, rsi_period, left, right, search_bars, min_gap,
-        min_rsi_diff, min_price_diff_pct, strict_extreme
+        min_rsi_diff, min_price_diff_pct, strict_extreme, token
     ) = params
 
-    # Chhota random stagger — sab threads ek hi instant pe Yahoo ko hit
-    # nahi karte, jisse rate-limit / empty-response chance kam ho jaata hai.
-    time.sleep(random.uniform(0, 0.4))
+    # Chhota random stagger — sab threads ek hi instant pe Upstox ko hit
+    # nahi karte, jisse 429 (rate-limit) chance kam ho jaata hai.
+    time.sleep(random.uniform(0, 0.15))
 
     try:
-        d = download_tf(symbol, timeframe, years, _current_trading_day())
+        d = download_tf(symbol, timeframe, years, _current_trading_day(), token)
     except Exception as e:
         return symbol, [], f"no data ({e})"
 
@@ -523,6 +554,27 @@ m3.metric("Universe", "NSE F&O only")
 st.caption(f"Universe source: {universe_source}")
 
 with st.sidebar:
+    st.header("Upstox Access")
+    _secret_token = get_upstox_token()
+    if _secret_token:
+        st.success("Token loaded (secrets)")
+        upstox_token = _secret_token
+    else:
+        upstox_token = st.text_input(
+            "Upstox Access Token",
+            type="password",
+            value=st.session_state.get("upstox_token", ""),
+            help=(
+                "Upstox token daily ~3:30 AM ko expire ho jaata hai, roz naya "
+                "daalna padega. Permanent use ke liye Streamlit Cloud → App "
+                "Settings → Secrets mein UPSTOX_ACCESS_TOKEN=<token> daalna "
+                "behtar hai (GitHub par commit mat karo)."
+            ),
+        )
+        st.session_state["upstox_token"] = upstox_token
+        if not upstox_token:
+            st.warning("Token ke bina data fetch nahi hoga.")
+
     st.header("Scanner Settings")
 
     timeframe = st.selectbox(
@@ -545,8 +597,8 @@ with st.sidebar:
         step=0.1
     )
 
-    if timeframe == "4 Hour" and years > 2:
-        st.warning("4 Hour data provider usually ~2 years tak hi reliable history deta hai.")
+    if timeframe == "4 Hour" and years > 4:
+        st.warning("4 Hour (hourly) data Upstox par Jan-2022 se hi available hai.")
 
     st.subheader("RSI / Pivot")
     rsi_period = st.number_input("RSI period", 2, 50, 14)
@@ -562,28 +614,29 @@ with st.sidebar:
         value=False
     )
 
-    workers = st.slider("Parallel workers", 1, 8, 2)
+    workers = st.slider("Parallel workers", 1, 8, 4)
     st.caption(
-        "Kam workers = Yahoo Finance rate-limit hone ka chance kam, "
-        "results zyada consistent aate hain."
+        "Upstox authenticated API hai, Yahoo jaisa aggressive block nahi karta — "
+        "phir bhi zyada workers se 429 (rate-limit) aa sakta hai."
     )
 
     if st.button("🔄 Refresh F&O Universe"):
         get_fno_stocks.clear()
+        get_instrument_map.clear()
         download_tf.clear()
         st.rerun()
 
 run = st.button(
     f"▶ RUN SCANNER — {len(fno_stocks)} F&O STOCKS",
     type="primary",
-    disabled=(len(fno_stocks) == 0)
+    disabled=(len(fno_stocks) == 0 or not upstox_token)
 )
 
 if run:
     params = (
         timeframe, divergence_mode, float(years), int(rsi_period), int(left), int(right),
         int(search_bars), int(min_gap), float(min_rsi_diff),
-        float(min_price_diff_pct), bool(strict_extreme)
+        float(min_price_diff_pct), bool(strict_extreme), upstox_token
     )
 
     progress = st.progress(0)
@@ -631,7 +684,7 @@ if run:
                 hide_index=True,
             )
             st.caption(
-                "Yeh symbols is scan mein Yahoo se data nahi le paaye (rate-limit/timeout ke baad "
+                "Yeh symbols is scan mein Upstox se data nahi le paaye (rate-limit/timeout ke baad "
                 "bhi 4 retries fail), isliye inke liye koi signal check hi nahi ho paaya — 'no signal' "
                 "aur 'fetch failed' alag cheezein hain. Dobara RUN SCANNER dabao, failed symbols agli "
                 "baar fresh retry honge (cache nahi hote)."
