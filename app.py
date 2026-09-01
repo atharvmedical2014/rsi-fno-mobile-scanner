@@ -2,6 +2,7 @@ import math
 import re
 import time
 import random
+import traceback
 from io import StringIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -129,6 +130,8 @@ def rsi_wilder(close, period=14):
     return out
 
 def pivot_lows(series, left=2, right=2):
+    if isinstance(series, pd.DataFrame):
+        series = series.iloc[:, 0]
     a = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
     out = []
     for i in range(left, len(a)-right):
@@ -139,6 +142,8 @@ def pivot_lows(series, left=2, right=2):
     return out
 
 def pivot_highs(series, left=2, right=2):
+    if isinstance(series, pd.DataFrame):
+        series = series.iloc[:, 0]
     a = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
     out = []
     for i in range(left, len(a)-right):
@@ -454,10 +459,17 @@ def scan_symbol(symbol, params):
     if d.empty:
         return symbol, [], "no data"
 
-    sigs = detect_signals(
-        d, timeframe, divergence_mode, rsi_period, left, right, search_bars, min_gap,
-        min_rsi_diff, min_price_diff_pct, strict_extreme, years
-    )
+    try:
+        sigs = detect_signals(
+            d, timeframe, divergence_mode, rsi_period, left, right, search_bars, min_gap,
+            min_rsi_diff, min_price_diff_pct, strict_extreme, years
+        )
+    except Exception as e:
+        # Poora traceback (last 2 frames) capture karte hain taaki agar
+        # koi aur edge-case crash kare to exact line pata chale, sirf
+        # generic "exception: ..." message nahi.
+        tb = "".join(traceback.format_exception(type(e), e, e.__traceback__)[-2:]).strip()
+        return symbol, [], f"signal-calc error: {tb}"
 
     rows = [{"Symbol": symbol, **s} for s in sigs]
     return symbol, rows, None
