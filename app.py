@@ -26,6 +26,7 @@ FALLBACK_URL = "https://optionperks.com/lot_size"
 
 UPSTOX_NSE_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 UPSTOX_HIST_CANDLE_URL = "https://api.upstox.com/v3/historical-candle/{instrument_key}/{unit}/{interval}/{to_date}/{from_date}"
+UPSTOX_INTRADAY_CANDLE_URL = "https://api.upstox.com/v3/historical-candle/intraday/{instrument_key}/{unit}/{interval}"
 
 INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
 
@@ -190,6 +191,38 @@ def get_instrument_map():
                 mapping[sym] = key
     return mapping
 
+def _upstox_fetch_intraday_with_retry(instrument_key, unit, interval, token, attempts=3):
+    """Upstox ka Historical Candle endpoint AAJ ki candle KABHI nahi deta —
+    wo sirf poori tarah 'settled' purani candles deta hai (aaj ki candle
+    unki taraf se agli subah 'historical' mein move hoti hai). Aaj ka data
+    paane ka EK-hi tarika ye alag Intraday endpoint hai."""
+    url = UPSTOX_INTRADAY_CANDLE_URL.format(
+        instrument_key=instrument_key, unit=unit, interval=interval,
+    )
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+    last_exc = None
+    for i in range(attempts):
+        try:
+            r = requests.get(url, headers=headers, timeout=20)
+            if r.status_code == 200:
+                js = r.json()
+                return js.get("data", {}).get("candles", []) or []
+            if r.status_code == 401:
+                raise RuntimeError("Upstox token invalid/expired (401) — sidebar mein fresh token daalein")
+            if r.status_code == 429:
+                time.sleep((1.5 ** i) + random.uniform(0, 0.5))
+                continue
+            # Intraday endpoint weekend/pre-market pe khaali/error de sakta
+            # hai — ye fatal nahi hai, bas aaj ka data nahi milega.
+            return []
+        except RuntimeError:
+            raise
+        except Exception as e:
+            last_exc = e
+        if i < attempts - 1:
+            time.sleep((1.2 ** i) + random.uniform(0, 0.3))
+    return []
+
 def _upstox_fetch_with_retry(instrument_key, unit, interval, from_date, to_date, token, attempts=3):
     url = UPSTOX_HIST_CANDLE_URL.format(
         instrument_key=instrument_key, unit=unit, interval=interval,
@@ -310,6 +343,17 @@ def download_tf(symbol, timeframe, years, trading_day, token):
     candles = _upstox_fetch_with_retry(
         instrument_key, unit, interval, from_date.isoformat(), to_date.isoformat(), token
     )
+
+    # Historical endpoint AAJ ki candle kabhi nahi deta (Upstox use agli
+    # subah "historical" mein move karta hai) — sirf Daily aur 4 Hour ke
+    # liye "aaj" maayne rakhta hai (Monthly/Weekly ka current period abhi
+    # bhi ban raha hota hai), isliye unke liye alag se Intraday endpoint
+    # se aaj ka data laake jodte hain.
+    if timeframe in ("Daily", "4 Hour"):
+        today_candles = _upstox_fetch_intraday_with_retry(instrument_key, unit, interval, token)
+        if today_candles:
+            candles = today_candles + candles
+
     if not candles:
         raise RuntimeError(f"no data for {symbol}")
 
@@ -320,6 +364,7 @@ def download_tf(symbol, timeframe, years, trading_day, token):
     )
     df["ts"] = pd.to_datetime(df["ts"])
     df = df.set_index("ts").sort_index()
+    df = df[~df.index.duplicated(keep="first")]
     for c in ["Open", "High", "Low", "Close", "Volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["Close"])
