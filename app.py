@@ -246,7 +246,15 @@ def remove_incomplete(df, timeframe):
         if idx.tz is not None:
             idx = idx.tz_localize(None)
         x.index = idx
-        x = x[x.index.date < now.date()]
+        # NSE 3:30 PM IST ko band hoti hai. Pehle ye code hamesha "aaj" ki
+        # date wali candle hata deta tha — chahe market band ho chuki ho
+        # aur wo candle already fully closed/final ho. Isse "aaj ka" signal
+        # kabhi bhi usi din nahi dikhta tha, hamesha 1-din purana lagta tha.
+        # Ab sirf market-hours ke andar (candle abhi genuinely ban rahi ho)
+        # hi aaj ki date drop karte hain; close ke baad use rakhte hain.
+        market_close = now.replace(hour=15, minute=35, second=0, microsecond=0)
+        if now < market_close:
+            x = x[x.index.date < now.date()]
 
     elif timeframe == "4 Hour":
         if idx.tz is None:
