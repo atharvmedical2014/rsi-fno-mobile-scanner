@@ -263,6 +263,10 @@ def remove_incomplete(df, timeframe):
         if idx.tz is not None:
             idx = idx.tz_localize(None)
         x.index = idx
+        # NOTE: isme bhi Weekly jaisa hi issue hai (neeche dekho) - abhi
+        # ke liye conservative rakha hai (hamesha current month drop karta
+        # hai), kyunki "month ka aakhri trading din" nikalna (weekends /
+        # exchange holidays ke saath) Daily/Weekly jitna seedha nahi hai.
         x = x[
             (x.index.year < now.year) |
             ((x.index.year == now.year) & (x.index.month < now.month))
@@ -272,8 +276,23 @@ def remove_incomplete(df, timeframe):
         if idx.tz is not None:
             idx = idx.tz_localize(None)
         x.index = idx
-        if len(x) and x.index[-1].to_period("W") == now.tz_localize(None).to_period("W"):
-            x = x.iloc[:-1]
+        # FIX: pehle ye code hamesha is hafte ki candle hata deta tha —
+        # chahe Friday market-close (3:30 PM IST) ho chuki ho aur wo
+        # candle already fully closed/final ho (bilkul Daily wala pehle
+        # wala bug, same pattern). Isse "is hafte ka" signal kabhi bhi
+        # usi Friday ko nahi dikhta tha, hamesha ek hafta purana lagta
+        # tha. Ab sirf jab hafta abhi khatam NAHI hua ho (yani Friday
+        # market-close se pehle) tab hi current-week candle drop karte
+        # hain; close ke baad use rakhte hain.
+        if len(x):
+            now_naive = now.tz_localize(None)
+            week_start = now_naive.normalize() - pd.Timedelta(days=now_naive.weekday())  # is hafte ka Monday
+            week_friday_close = week_start + pd.Timedelta(days=4, hours=15, minutes=35)
+            if (
+                x.index[-1].to_period("W") == now_naive.to_period("W")
+                and now_naive < week_friday_close
+            ):
+                x = x.iloc[:-1]
 
     elif timeframe == "Daily":
         if idx.tz is not None:
