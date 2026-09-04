@@ -568,10 +568,12 @@ def scan_symbol(symbol, params):
     try:
         d = download_tf(symbol, timeframe, years, _current_trading_day(), token)
     except Exception as e:
-        return symbol, [], f"no data ({e})"
+        return symbol, [], f"no data ({e})", None
 
     if d.empty:
-        return symbol, [], "no data"
+        return symbol, [], "no data", None
+
+    last_candle_date = d.index[-1].date()
 
     try:
         sigs = detect_signals(
@@ -589,10 +591,10 @@ def scan_symbol(symbol, params):
             f"cols={list(d.columns)} dup={bool(d.columns.duplicated().any())} "
             f"shape={d.shape}"
         )
-        return symbol, [], f"signal-calc error [{diag}]: {tb}"
+        return symbol, [], f"signal-calc error [{diag}]: {tb}", last_candle_date
 
     rows = [{"Symbol": symbol, **s} for s in sigs]
-    return symbol, rows, None
+    return symbol, rows, None, last_candle_date
 
 st.markdown("""
 <style>
@@ -719,6 +721,7 @@ if run:
     errors = 0
     completed = 0
     error_detail = []
+    last_dates = []  # DIAGNOSTIC: har symbol ka fetch hua aakhri candle ki date
 
     with ThreadPoolExecutor(max_workers=int(workers)) as ex:
         futures = {
@@ -730,8 +733,10 @@ if run:
             sym = futures[fut]
             completed += 1
             try:
-                _, found, err = fut.result()
+                _, found, err, last_date = fut.result()
                 rows.extend(found)
+                if last_date is not None:
+                    last_dates.append(last_date)
                 if err:
                     errors += 1
                     error_detail.append((sym, err))
@@ -747,6 +752,35 @@ if run:
 
     progress.empty()
     status.empty()
+
+    # DIAGNOSTIC: dikhao ki actually kis date tak ka data mila - taaki
+    # "aaj koi signal nahi" aur "aaj ka data hi nahi mila" mein farak
+    # saaf dikh jaaye, guess karna na pade.
+    if last_dates:
+        today_ist = pd.Timestamp.now(tz="Asia/Kolkata").date()
+        date_counts = pd.Series(last_dates).value_counts().sort_index(ascending=False)
+        most_common_date = date_counts.index[0]
+        n_today = int((pd.Series(last_dates) == today_ist).sum())
+        with st.expander(
+            f"🔍 Data freshness check — sabse recent candle date: {most_common_date} "
+            f"({n_today}/{len(last_dates)} symbols mein AAJ ({today_ist}) ki candle hai)",
+            expanded=(n_today == 0),
+        ):
+            st.dataframe(
+                date_counts.rename_axis("Last candle date").reset_index(name="Symbol count"),
+                use_container_width=True,
+                hide_index=True,
+            )
+            if n_today == 0:
+                st.warning(
+                    f"Kisi bhi symbol mein AAJ ({today_ist}) ki candle nahi mili - sabse recent "
+                    f"data {most_common_date} ka hai. Iska matlab 'aaj koi signal nahi mila' nahi "
+                    "hai - balki 'aaj ka data hi Upstox se nahi mila'. Ye Upstox ke Historical + "
+                    "Intraday endpoints ke beech ek data-availability gap ho sakta hai (market "
+                    "close ke baad, agli subah se pehle) - code ka bug nahi."
+                )
+            else:
+                st.success(f"{n_today} symbols mein aaj ki candle maujood hai - data fetch sahi kaam kar raha hai.")
 
     if error_detail:
         with st.expander(f"⚠ Data fetch failed for {len(error_detail)} symbol(s) — click to see which"):
